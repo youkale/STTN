@@ -41,6 +41,10 @@ parser.add_argument("--resolution", type=str, help="处理分辨率，格式：W
 parser.add_argument("--scale", type=float, default=1.0, help="分辨率缩放比例 (0-1]，默认1.0保持原分辨率")
 parser.add_argument("--short-side", type=int, choices=[270, 360, 480, 540, 720, 1080],
                     help="等比缩放到指定短边尺寸，保持宽高比 (270/360/480/540/720/1080)")
+parser.add_argument("--crop", action="store_true",
+                    help="裁剪模式：仅处理区域周围部分，大幅降低显存占用（需配合--regions使用）")
+parser.add_argument("--crop-padding", type=int, default=32,
+                    help="裁剪时的边界padding（像素），避免边界artifacts，默认32")
 args = parser.parse_args()
 
 
@@ -321,6 +325,149 @@ def read_frame_from_videos(vname):
     return frames
 
 
+def calculate_crop_region(regions, video_width, video_height, padding=32):
+    """
+    根据regions计算裁剪区域（加padding）
+
+    参数:
+        regions: 区域列表 [[left,bottom,right,top],...]，相对坐标(0-1)
+        video_width, video_height: 原视频尺寸
+        padding: 边界padding（像素）
+
+    返回:
+        (x, y, crop_w, crop_h): 裁剪参数（像素坐标）
+        (min_left, min_bottom, max_right, max_top): 合并后的区域边界（相对坐标）
+    """
+    # 合并所有区域的边界
+    all_lefts = [r[0] for r in regions]
+    all_bottoms = [r[1] for r in regions]
+    all_rights = [r[2] for r in regions]
+    all_tops = [r[3] for r in regions]
+
+    min_left = min(all_lefts)
+    min_bottom = min(all_bottoms)
+    max_right = max(all_rights)
+    max_top = max(all_tops)
+
+    # 转换为像素坐标
+    x1_pixel = int(min_left * video_width)
+    x2_pixel = int(max_right * video_width)
+
+    # Y坐标：左下角原点 -> 左上角原点
+    y1_pixel = int((1 - max_top) * video_height)
+    y2_pixel = int((1 - min_bottom) * video_height)
+
+    # 添加padding
+    x1_pixel = max(0, x1_pixel - padding)
+    y1_pixel = max(0, y1_pixel - padding)
+    x2_pixel = min(video_width, x2_pixel + padding)
+    y2_pixel = min(video_height, y2_pixel + padding)
+
+    # 计算裁剪区域尺寸
+    crop_w = x2_pixel - x1_pixel
+    crop_h = y2_pixel - y1_pixel
+
+    # 确保尺寸是偶数
+    crop_w = crop_w if crop_w % 2 == 0 else crop_w - 1
+    crop_h = crop_h if crop_h % 2 == 0 else crop_h - 1
+
+    return (x1_pixel, y1_pixel, crop_w, crop_h), (min_left, min_bottom, max_right, max_top)
+
+
+def transform_regions_to_crop_space(regions, crop_region_bounds, video_width, video_height, crop_w, crop_h):
+    """
+    将全局坐标的regions转换为裁剪空间的相对坐标
+
+    参数:
+        regions: 原始区域列表（全局相对坐标）
+        crop_region_bounds: (min_left, min_bottom, max_right, max_top) 裁剪区域边界（全局相对坐标）
+        video_width, video_height: 原视频尺寸
+        crop_w, crop_h: 裁剪后的尺寸
+
+    返回:
+        transformed_regions: 转换后的区域列表（裁剪空间相对坐标）
+    """
+    min_left, min_bottom, max_right, max_top = crop_region_bounds
+
+    # 裁剪区域的尺寸（相对坐标）
+    crop_rel_width = max_right - min_left
+    crop_rel_height = max_top - min_bottom
+
+    transformed_regions = []
+    for region in regions:
+        left, bottom, right, top = region
+
+        # 转换到裁剪空间（相对于裁剪区域的左下角）
+        new_left = (left - min_left) / crop_rel_width
+        new_right = (right - min_left) / crop_rel_width
+        new_bottom = (bottom - min_bottom) / crop_rel_height
+        new_top = (top - min_bottom) / crop_rel_height
+
+        # 确保在[0,1]范围内
+        new_left = max(0, min(1, new_left))
+        new_right = max(0, min(1, new_right))
+        new_bottom = max(0, min(1, new_bottom))
+        new_top = max(0, min(1, new_top))
+
+        transformed_regions.append([new_left, new_bottom, new_right, new_top])
+
+    return transformed_regions
+
+
+def crop_video_ffmpeg(input_video, output_video, x, y, width, height):
+    """
+    使用ffmpeg裁剪视频
+
+    参数:
+        input_video: 输入视频路径
+        output_video: 输出视频路径
+        x, y: 裁剪起始坐标
+        width, height: 裁剪尺寸
+    """
+    cmd = [
+        'ffmpeg', '-y', '-i', input_video,
+        '-filter:v', f'crop={width}:{height}:{x}:{y}',
+        '-c:a', 'copy',  # 音频直接复制
+        output_video
+    ]
+
+    print(f"裁剪命令: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg裁剪失败: {result.stderr}")
+
+    return output_video
+
+
+def merge_video_ffmpeg(original_video, inpainted_video, output_video, x, y):
+    """
+    使用ffmpeg将修复后的视频合并回原视频
+
+    参数:
+        original_video: 原始视频路径
+        inpainted_video: 修复后的裁剪视频路径
+        output_video: 输出视频路径
+        x, y: overlay位置
+    """
+    cmd = [
+        'ffmpeg', '-y',
+        '-i', original_video,
+        '-i', inpainted_video,
+        '-filter_complex', f'[0:v][1:v]overlay={x}:{y}',
+        '-c:a', 'copy',  # 保留原视频音频
+        output_video
+    ]
+
+    print(f"合并命令: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg合并失败: {result.stderr}")
+
+    return output_video
+
+
 def generate_masks_from_regions(video_path, regions, num_frames=None):
     """
     根据区域坐标生成mask图片，保存到output目录
@@ -420,12 +567,73 @@ def main_worker():
         raise ValueError("必须指定 --mask 或 --regions 参数之一")
     if args.mask is not None and args.regions is not None:
         raise ValueError("--mask 和 --regions 参数不能同时使用")
+    if args.crop and args.regions is None:
+        raise ValueError("--crop 模式必须配合 --regions 使用")
+
+    # 裁剪模式变量
+    crop_mode = args.crop and args.regions is not None
+    cropped_video = None
+    crop_x, crop_y = 0, 0
+    original_video = args.video
+
+    # 裁剪模式处理
+    if crop_mode:
+        print("\n" + "="*60)
+        print("🎯 裁剪模式：仅处理擦除区域周围部分")
+        print("="*60)
+
+        regions = json.loads(args.regions)
+
+        # 获取原视频信息
+        video_info = get_video_info_ffprobe(original_video)
+        if video_info is None:
+            video_info = get_video_info_opencv(original_video)
+        orig_w, orig_h, orig_fps = video_info
+
+        print(f"原视频尺寸: {orig_w}x{orig_h}")
+        print(f"擦除区域: {regions}")
+        print(f"边界padding: {args.crop_padding}px")
+
+        # 计算裁剪区域
+        (crop_x, crop_y, crop_w, crop_h), crop_bounds = calculate_crop_region(
+            regions, orig_w, orig_h, padding=args.crop_padding
+        )
+
+        print(f"\n裁剪参数:")
+        print(f"  位置: x={crop_x}, y={crop_y}")
+        print(f"  尺寸: {crop_w}x{crop_h}")
+        print(f"  显存降低: ~{(orig_w*orig_h)/(crop_w*crop_h):.1f}x")
+
+        # 转换regions到裁剪空间
+        transformed_regions = transform_regions_to_crop_space(
+            regions, crop_bounds, orig_w, orig_h, crop_w, crop_h
+        )
+        print(f"  转换后区域: {transformed_regions}")
+
+        # 裁剪视频
+        print("\n裁剪视频...")
+        output_base = "output"
+        os.makedirs(output_base, exist_ok=True)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        cropped_video = os.path.join(output_base, f"cropped_{timestamp}.mp4")
+
+        crop_video_ffmpeg(original_video, cropped_video, crop_x, crop_y, crop_w, crop_h)
+        print(f"✓ 裁剪完成: {cropped_video}")
+
+        # 更新处理目标
+        video_to_process = cropped_video
+        regions_to_use = transformed_regions
+
+        print("="*60 + "\n")
+    else:
+        video_to_process = original_video
+        regions_to_use = json.loads(args.regions) if args.regions else None
 
     # 设置处理分辨率
     print("\n" + "="*60)
     print("视频信息检测")
     print("="*60)
-    setup_resolution(args.video, args.resolution, args.scale, args.short_side)
+    setup_resolution(video_to_process, args.resolution, args.scale, args.short_side)
     print("="*60 + "\n")
 
     # 先生成或准备 mask（在加载模型之前）
@@ -435,15 +643,14 @@ def main_worker():
         print("="*60)
         print("生成 Mask")
         print("="*60)
-        regions = json.loads(args.regions)
-        print(f"区域坐标: {regions}")
+        print(f"区域坐标: {regions_to_use}")
 
         # 获取视频帧数
-        vidcap = cv2.VideoCapture(args.video)
+        vidcap = cv2.VideoCapture(video_to_process)
         video_length = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
         vidcap.release()
 
-        temp_mask_dir = generate_masks_from_regions(args.video, regions, video_length)
+        temp_mask_dir = generate_masks_from_regions(video_to_process, regions_to_use, video_length)
         print("="*60 + "\n")
     else:
         # 验证mask目录存在
@@ -483,7 +690,7 @@ def main_worker():
     print("="*60)
     print("加载视频帧")
     print("="*60)
-    frames = read_frame_from_videos(args.video)
+    frames = read_frame_from_videos(video_to_process)
     video_length = len(frames)
     print(f"✓ 加载 {video_length} 帧")
     feats = _to_tensors(frames).unsqueeze(0)*2-1
@@ -547,9 +754,10 @@ def main_worker():
     print()  # 换行
     print(f'✓ 视频修复完成')
     print("="*60 + "\n")
+
     # 确定输出路径
     if args.output:
-        output_path = args.output
+        final_output_path = args.output
     else:
         # 默认输出到output目录
         output_base = "output"
@@ -558,21 +766,27 @@ def main_worker():
         if args.mask:
             # 使用mask目录名称
             mask_basename = os.path.basename(args.mask.rstrip('/'))
-            output_path = os.path.join(output_base, f"{mask_basename}_result.mp4")
+            final_output_path = os.path.join(output_base, f"{mask_basename}_result.mp4")
         else:
             # 使用视频名称
             video_name = os.path.splitext(os.path.basename(args.video))[0]
-            import datetime
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = os.path.join(output_base, f"{video_name}_inpainted_{timestamp}.mp4")
+            final_output_path = os.path.join(output_base, f"{video_name}_inpainted_{timestamp}.mp4")
 
-    # 保存输出视频
+    # 保存修复后的视频
     print("="*60)
     print("保存输出视频")
     print("="*60)
-    print(f"输出路径: {output_path}")
 
-    writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), default_fps, (w, h))
+    # 裁剪模式：先保存裁剪区域的修复视频
+    if crop_mode:
+        inpainted_crop_path = final_output_path.replace('.mp4', '_crop.mp4')
+        print(f"中间文件: {inpainted_crop_path}")
+    else:
+        inpainted_crop_path = final_output_path
+        print(f"输出路径: {final_output_path}")
+
+    writer = cv2.VideoWriter(inpainted_crop_path, cv2.VideoWriter_fourcc(*"mp4v"), default_fps, (w, h))
     for f in range(video_length):
         comp = np.array(comp_frames[f]).astype(
             np.uint8)*binary_masks[f] + frames[f] * (1-binary_masks[f])
@@ -580,14 +794,45 @@ def main_worker():
         print(f"写入帧: {f+1}/{video_length}", end='\r')
     writer.release()
     print()  # 换行
-    print(f'✓ 视频保存完成: {output_path}')
+    print(f'✓ 裁剪区域修复完成: {inpainted_crop_path}')
+    print("="*60 + "\n")
+
+    # 裁剪模式：合并回原视频
+    if crop_mode:
+        print("="*60)
+        print("合并到原视频")
+        print("="*60)
+        print(f"原视频: {original_video}")
+        print(f"修复区域: {inpainted_crop_path}")
+        print(f"最终输出: {final_output_path}")
+        print(f"Overlay位置: x={crop_x}, y={crop_y}")
+
+        merge_video_ffmpeg(original_video, inpainted_crop_path, final_output_path, crop_x, crop_y)
+
+        print(f'✓ 合并完成: {final_output_path}')
+
+        # 清理临时文件
+        print("\n清理临时文件...")
+        try:
+            if cropped_video and os.path.exists(cropped_video):
+                os.remove(cropped_video)
+                print(f"✓ 删除: {cropped_video}")
+            if os.path.exists(inpainted_crop_path):
+                os.remove(inpainted_crop_path)
+                print(f"✓ 删除: {inpainted_crop_path}")
+        except Exception as e:
+            print(f"⚠️  清理临时文件失败: {e}")
+
+        print("="*60 + "\n")
 
     # 保留mask目录供用户查看
     if temp_mask_dir is not None:
         print(f'✓ Mask文件保存在: {temp_mask_dir}')
-    print("="*60 + "\n")
 
+    print("="*60)
     print("🎉 全部完成！")
+    print(f"📹 最终输出: {final_output_path}")
+    print("="*60)
 
 
 
