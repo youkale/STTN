@@ -23,8 +23,8 @@ from tensorboardX import SummaryWriter
 from torchvision.utils import make_grid, save_image
 import torch.distributed as dist
 
-from core.dataset import Dataset
-from core.loss import AdversarialLoss
+from src.core.dataset import Dataset
+from src.core.loss import AdversarialLoss
 
 
 class Trainer():
@@ -44,49 +44,49 @@ class Trainer():
         if config['distributed']:
             self.train_sampler = DistributedSampler(
                 self.train_dataset,
-                num_replicas=config['world_size'], 
+                num_replicas=config['world_size'],
                 rank=config['global_rank'])
         self.train_loader = DataLoader(
             self.train_dataset,
             batch_size=self.train_args['batch_size'] // config['world_size'],
-            shuffle=(self.train_sampler is None), 
+            shuffle=(self.train_sampler is None),
             num_workers=self.train_args['num_workers'],
             sampler=self.train_sampler)
 
-        # set loss functions 
+        # set loss functions
         self.adversarial_loss = AdversarialLoss(type=self.config['losses']['GAN_LOSS'])
         self.adversarial_loss = self.adversarial_loss.to(self.config['device'])
         self.l1_loss = nn.L1Loss()
 
         # setup models including generator and discriminator
-        net = importlib.import_module('model.'+config['model'])
+        net = importlib.import_module('src.model.'+config['model'])
         self.netG = net.InpaintGenerator()
         self.netG = self.netG.to(self.config['device'])
         self.netD = net.Discriminator(
             in_channels=3, use_sigmoid=config['losses']['GAN_LOSS'] != 'hinge')
         self.netD = self.netD.to(self.config['device'])
         self.optimG = torch.optim.Adam(
-            self.netG.parameters(), 
+            self.netG.parameters(),
             lr=config['trainer']['lr'],
             betas=(self.config['trainer']['beta1'], self.config['trainer']['beta2']))
         self.optimD = torch.optim.Adam(
-            self.netD.parameters(), 
+            self.netD.parameters(),
             lr=config['trainer']['lr'],
             betas=(self.config['trainer']['beta1'], self.config['trainer']['beta2']))
         self.load()
 
         if config['distributed']:
             self.netG = DDP(
-                self.netG, 
-                device_ids=[self.config['local_rank']], 
+                self.netG,
+                device_ids=[self.config['local_rank']],
                 output_device=self.config['local_rank'],
-                broadcast_buffers=True, 
+                broadcast_buffers=True,
                 find_unused_parameters=False)
             self.netD = DDP(
-                self.netD, 
-                device_ids=[self.config['local_rank']], 
+                self.netD,
+                device_ids=[self.config['local_rank']],
                 output_device=self.config['local_rank'],
-                broadcast_buffers=True, 
+                broadcast_buffers=True,
                 find_unused_parameters=False)
 
         # set summary writer
@@ -143,11 +143,11 @@ class Trainer():
                 model_path, 'opt_{}.pth'.format(str(latest_epoch).zfill(5)))
             if self.config['global_rank'] == 0:
                 print('Loading model from {}...'.format(gen_path))
-            data = torch.load(gen_path, map_location=self.config['device'])
+            data = torch.load(gen_path, map_location=self.config['device'], weights_only=False)
             self.netG.load_state_dict(data['netG'])
-            data = torch.load(dis_path, map_location=self.config['device'])
+            data = torch.load(dis_path, map_location=self.config['device'], weights_only=False)
             self.netD.load_state_dict(data['netD'])
-            data = torch.load(opt_path, map_location=self.config['device'])
+            data = torch.load(opt_path, map_location=self.config['device'], weights_only=False)
             self.optimG.load_state_dict(data['optimG'])
             self.optimD.load_state_dict(data['optimD'])
             self.epoch = data['epoch']
@@ -187,7 +187,7 @@ class Trainer():
         pbar = range(int(self.train_args['iterations']))
         if self.config['global_rank'] == 0:
             pbar = tqdm(pbar, initial=self.iteration, dynamic_ncols=True, smoothing=0.01)
-        
+
         while True:
             self.epoch += 1
             if self.config['distributed']:
@@ -242,16 +242,16 @@ class Trainer():
             # generator l1 loss
             hole_loss = self.l1_loss(pred_img*masks, frames*masks)
             hole_loss = hole_loss / torch.mean(masks) * self.config['losses']['hole_weight']
-            gen_loss += hole_loss 
+            gen_loss += hole_loss
             self.add_summary(
                 self.gen_writer, 'loss/hole_loss', hole_loss.item())
 
             valid_loss = self.l1_loss(pred_img*(1-masks), frames*(1-masks))
             valid_loss = valid_loss / torch.mean(1-masks) * self.config['losses']['valid_weight']
-            gen_loss += valid_loss 
+            gen_loss += valid_loss
             self.add_summary(
                 self.gen_writer, 'loss/valid_loss', valid_loss.item())
-            
+
             self.optimG.zero_grad()
             gen_loss.backward()
             self.optimG.step()
@@ -269,4 +269,3 @@ class Trainer():
                 self.save(int(self.iteration//self.train_args['save_freq']))
             if self.iteration > self.train_args['iterations']:
                 break
-

@@ -15,8 +15,8 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 from PIL import Image, ImageFilter
 from skimage.color import rgb2gray, gray2rgb
-from core.utils import ZipReader, create_random_shape_with_random_motion
-from core.utils import Stack, ToTorchFormatTensor, GroupRandomHorizontalFlip
+from src.core.utils import ZipReader, create_random_shape_with_random_motion
+from src.core.utils import Stack, ToTorchFormatTensor, GroupRandomHorizontalFlip
 
 
 class Dataset(torch.utils.data.Dataset):

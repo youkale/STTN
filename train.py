@@ -7,8 +7,8 @@ from shutil import copyfile
 import torch
 import torch.multiprocessing as mp
 
-from core.trainer import Trainer
-from core.dist import (
+from src.core.trainer import Trainer
+from src.core.dist import (
     get_world_size,
     get_local_rank,
     get_global_rank,
@@ -39,9 +39,9 @@ def main_worker(rank, config):
 
     config['save_dir'] = os.path.join(config['save_dir'], '{}_{}'.format(config['model'],
                                                                          os.path.basename(args.config).split('.')[0]))
-    if torch.cuda.is_available(): 
+    if torch.cuda.is_available():
         config['device'] = torch.device("cuda:{}".format(config['local_rank']))
-    else: 
+    else:
         config['device'] = 'cpu'
 
     if (not config['distributed']) or config['global_rank'] == 0:
@@ -51,13 +51,13 @@ def main_worker(rank, config):
         if not os.path.isfile(config_path):
             copyfile(config['config'], config_path)
         print('[**] create folder {}'.format(config['save_dir']))
-    
+
     trainer = Trainer(config, debug=args.exam)
     trainer.train()
 
 
 if __name__ == "__main__":
-    
+
     # loading configs
     config = json.load(open(args.config))
     config['model'] = args.model
@@ -70,10 +70,10 @@ if __name__ == "__main__":
 
     # setup distributed parallel training environments
     if get_master_ip() == "127.0.0.1":
-        # manually launch distributed processes 
+        # manually launch distributed processes
         mp.spawn(main_worker, nprocs=config['world_size'], args=(config,))
     else:
-        # multiple processes have been launched by openmpi 
+        # multiple processes have been launched by openmpi
         config['local_rank'] = get_local_rank()
         config['global_rank'] = get_global_rank()
         main_worker(-1, config)

@@ -99,10 +99,13 @@ Repository = "https://github.com/researchmm/STTN"
 Documentation = "https://github.com/researchmm/STTN/blob/master/README.md"
 
 [tool.setuptools]
-packages = ["core", "model"]
+packages = ["src", "src.core", "src.model"]
 
 [tool.setuptools.package-data]
 "*" = ["*.json"]
+
+[tool.setuptools.package-dir]
+"" = "."
 
 [tool.black]
 line-length = 120
