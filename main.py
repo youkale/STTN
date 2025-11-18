@@ -778,6 +778,30 @@ def generate_masks_from_regions(video_path, regions, num_frames=None):
         y1 = max(0, min(y1, h - 1))
         y2 = max(0, min(y2, h))
 
+        # 内部padding处理：避免mask超出实际需要擦除的区域
+        # 如果regions坐标非常接近边界(0或1)，可能是裁剪后的坐标
+        # 添加内部padding，默认向内收缩8像素
+        inner_padding = 8
+
+        # 只在区域足够大时才padding
+        if (x2 - x1) > inner_padding * 2 and (y2 - y1) > inner_padding * 2:
+            # 判断是否接近边界（说明是裁剪后的全尺寸坐标）
+            is_near_left = left < 0.05
+            is_near_right = right > 0.95
+            is_near_bottom = bottom < 0.05
+            is_near_top = top > 0.95
+
+            if is_near_left:
+                x1 += inner_padding
+            if is_near_right:
+                x2 -= inner_padding
+            if is_near_bottom:
+                y2 -= inner_padding
+            if is_near_top:
+                y1 += inner_padding
+
+            print(f"  应用内部padding: {inner_padding}px (left={is_near_left}, right={is_near_right}, bottom={is_near_bottom}, top={is_near_top})")
+
         # 绘制白色区域
         mask[y1:y2, x1:x2] = 255
 
@@ -786,8 +810,9 @@ def generate_masks_from_regions(video_path, regions, num_frames=None):
         print(f"    -> mask尺寸: {mask.shape}, 白色像素数: {np.sum(mask == 255)}")
 
     # 应用膨胀操作（与read_mask保持一致）
+    # 注意：膨胀可能会把mask扩展到padding区域，所以要小心
     mask = cv2.dilate(mask, cv2.getStructuringElement(
-        cv2.MORPH_CROSS, (3, 3)), iterations=4)
+        cv2.MORPH_CROSS, (3, 3)), iterations=2)  # 从4减少到2次迭代
 
     # 只保存一张mask图片
     mask_path = os.path.join(mask_dir, 'mask.png')
