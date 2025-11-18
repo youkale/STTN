@@ -798,25 +798,29 @@ def generate_masks_from_regions(video_path, regions, num_frames=None):
     return mask_dir
 
 
-def process_single_video(video_path, output_path_override=None):
+def process_single_video(video_path, regions_to_use=None, output_path_override=None):
     """
     处理单个视频（用于主流程和分段处理）
 
     参数:
         video_path: 输入视频路径
+        regions_to_use: 使用的regions坐标（已经转换好的）
         output_path_override: 强制指定输出路径（用于分段处理）
 
     返回:
         output_path: 输出视频路径
     """
-    # 裁剪模式变量
-    crop_mode = args.crop and args.regions is not None
-    cropped_video = None
-    crop_x, crop_y = 0, 0
-    original_video = video_path
+    # 注意：裁剪逻辑已经在main_worker中处理，这里只处理已裁剪的视频
+    video_to_process = video_path
 
-    # 裁剪模式处理
-    if crop_mode:
+    # 如果没有传入regions，从args获取
+    if regions_to_use is None and args.regions is not None:
+        regions_to_use = json.loads(args.regions)
+
+    # ===== 以下是原来的非裁剪逻辑，去掉裁剪部分 =====
+
+    # 旧的裁剪逻辑已移到main_worker
+    if False:  # 保持缩进，但永远不执行
         print("\n" + "="*60)
         print("🎯 裁剪模式：仅处理擦除区域周围部分")
         print("="*60)
@@ -882,9 +886,6 @@ def process_single_video(video_path, output_path_override=None):
         regions_to_use = transformed_regions
 
         print("="*60 + "\n")
-    else:
-        video_to_process = original_video
-        regions_to_use = json.loads(args.regions) if args.regions else None
 
     # 设置处理分辨率
     print("\n" + "="*60)
@@ -1092,20 +1093,13 @@ def process_single_video(video_path, output_path_override=None):
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             final_output_path = os.path.join(output_base, f"{video_name}_inpainted_{timestamp}.mp4")
 
-    # 保存修复后的视频
+    # 保存修复后的视频（简化版，不处理overlay）
     print("="*60)
     print("保存输出视频")
     print("="*60)
+    print(f"输出路径: {final_output_path}")
 
-    # 裁剪模式：先保存裁剪区域的修复视频
-    if crop_mode:
-        inpainted_crop_path = final_output_path.replace('.mp4', '_crop.mp4')
-        print(f"中间文件: {inpainted_crop_path}")
-    else:
-        inpainted_crop_path = final_output_path
-        print(f"输出路径: {final_output_path}")
-
-    writer = cv2.VideoWriter(inpainted_crop_path, cv2.VideoWriter_fourcc(*"mp4v"), default_fps, (w, h))
+    writer = cv2.VideoWriter(final_output_path, cv2.VideoWriter_fourcc(*"mp4v"), default_fps, (w, h))
     for f in range(video_length):
         comp = np.array(comp_frames[f]).astype(
             np.uint8)*binary_masks[f] + frames[f] * (1-binary_masks[f])
@@ -1113,36 +1107,8 @@ def process_single_video(video_path, output_path_override=None):
         print(f"写入帧: {f+1}/{video_length}", end='\r')
     writer.release()
     print()  # 换行
-    print(f'✓ 裁剪区域修复完成: {inpainted_crop_path}')
+    print(f'✓ 视频保存完成: {final_output_path}')
     print("="*60 + "\n")
-
-    # 裁剪模式：合并回原视频
-    if crop_mode:
-        print("="*60)
-        print("合并到原视频")
-        print("="*60)
-        print(f"原视频: {original_video}")
-        print(f"修复区域: {inpainted_crop_path}")
-        print(f"最终输出: {final_output_path}")
-        print(f"Overlay位置: x={crop_x}, y={crop_y}")
-
-        merge_video_ffmpeg(original_video, inpainted_crop_path, final_output_path, crop_x, crop_y)
-
-        print(f'✓ 合并完成: {final_output_path}')
-
-        # 清理临时文件
-        print("\n清理临时文件...")
-        try:
-            if cropped_video and os.path.exists(cropped_video):
-                os.remove(cropped_video)
-                print(f"✓ 删除: {cropped_video}")
-            if os.path.exists(inpainted_crop_path):
-                os.remove(inpainted_crop_path)
-                print(f"✓ 删除: {inpainted_crop_path}")
-        except Exception as e:
-            print(f"⚠️  清理临时文件失败: {e}")
-
-        print("="*60 + "\n")
 
     # 保留mask目录供用户查看
     if temp_mask_dir is not None:
@@ -1167,23 +1133,90 @@ def main_worker():
     if args.crop and args.regions is None:
         raise ValueError("--crop 模式必须配合 --regions 使用")
 
-    # 自动分段模式
-    if args.auto_split:
+    # ========== 第1步：裁剪原视频（如果需要） ==========
+    crop_mode = args.crop and args.regions is not None
+    cropped_video = None
+    crop_x, crop_y = 0, 0
+    original_video = args.video
+    transformed_regions = None
+
+    if crop_mode:
         print("\n" + "="*60)
-        print("🔄 自动分段处理模式")
+        print("🎯 步骤1: 裁剪原视频")
         print("="*60)
 
-        # 获取视频信息
-        video_info = get_video_info_ffprobe(args.video)
+        regions = json.loads(args.regions)
+
+        # 获取原视频信息
+        video_info = get_video_info_ffprobe(original_video)
         if video_info is None:
-            video_info = get_video_info_opencv(args.video)
+            video_info = get_video_info_opencv(original_video)
+        orig_w, orig_h, orig_fps = video_info
+
+        print(f"原视频尺寸: {orig_w}x{orig_h}")
+        print(f"擦除区域: {regions}")
+        print(f"边界padding: {args.crop_padding}px")
+
+        # 计算裁剪区域
+        (crop_x, crop_y, crop_w, crop_h), crop_bounds = calculate_crop_region(
+            regions, orig_w, orig_h, padding=args.crop_padding
+        )
+
+        print(f"\n裁剪参数:")
+        print(f"  位置: x={crop_x}, y={crop_y}")
+        print(f"  尺寸: {crop_w}x{crop_h}")
+        print(f"  显存降低: ~{(orig_w*orig_h)/(crop_w*crop_h):.1f}x")
+
+        # 转换regions到裁剪空间
+        actual_crop_bounds = (
+            crop_x / orig_w,
+            1 - (crop_y + crop_h) / orig_h,
+            (crop_x + crop_w) / orig_w,
+            1 - crop_y / orig_h
+        )
+
+        transformed_regions = transform_regions_to_crop_space(
+            regions, actual_crop_bounds, orig_w, orig_h, crop_w, crop_h
+        )
+        print(f"  实际裁剪边界: {actual_crop_bounds}")
+        print(f"  转换后区域: {transformed_regions}")
+
+        # 裁剪视频
+        print("\n裁剪视频...")
+        output_base = "output"
+        os.makedirs(output_base, exist_ok=True)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        cropped_video = os.path.join(output_base, f"cropped_{timestamp}.mp4")
+
+        crop_video_ffmpeg(original_video, cropped_video, crop_x, crop_y, crop_w, crop_h)
+        print(f"✓ 裁剪完成: {cropped_video}")
+        print("="*60 + "\n")
+
+        # 更新处理目标
+        video_to_process = cropped_video
+        regions_for_processing = transformed_regions
+    else:
+        video_to_process = original_video
+        regions_for_processing = json.loads(args.regions) if args.regions else None
+
+    # ========== 第2步：自动分段处理（如果需要） ==========
+    if args.auto_split:
+        print("\n" + "="*60)
+        print("🔄 步骤2: 自动分段处理")
+        print("="*60)
+
+        # 获取待处理视频信息（已裁剪的或原视频）
+        video_info = get_video_info_ffprobe(video_to_process)
+        if video_info is None:
+            video_info = get_video_info_opencv(video_to_process)
         video_w, video_h, video_fps = video_info
 
         # 获取视频帧数
-        vidcap = cv2.VideoCapture(args.video)
+        vidcap = cv2.VideoCapture(video_to_process)
         total_frames = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
         vidcap.release()
 
+        print(f"待处理视频: {video_to_process}")
         print(f"视频信息: {video_w}x{video_h}, {total_frames}帧, {video_fps}fps")
 
         # 计算每段最大帧数
@@ -1191,23 +1224,13 @@ def main_worker():
             max_frames_per_segment = args.max_frames
             print(f"使用指定的最大帧数: {max_frames_per_segment}")
         else:
-            # 自动计算
+            # 自动计算（基于当前视频尺寸）
             if torch.cuda.is_available():
                 gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
             else:
                 gpu_memory_gb = 8  # CPU模式默认
 
-            # 如果是裁剪模式，需要先计算裁剪后的尺寸
-            if args.crop and args.regions:
-                regions = json.loads(args.regions)
-                (_, _, crop_w, crop_h), _ = calculate_crop_region(
-                    regions, video_w, video_h, padding=args.crop_padding
-                )
-                max_frames_per_segment = calculate_max_frames(crop_w, crop_h, gpu_memory_gb)
-                print(f"裁剪后尺寸: {crop_w}x{crop_h}")
-            else:
-                max_frames_per_segment = calculate_max_frames(video_w, video_h, gpu_memory_gb)
-
+            max_frames_per_segment = calculate_max_frames(video_w, video_h, gpu_memory_gb)
             print(f"GPU显存: {gpu_memory_gb:.1f}GB")
             print(f"自动计算最大帧数: {max_frames_per_segment}帧 (~{max_frames_per_segment/video_fps:.1f}秒)")
 
@@ -1215,7 +1238,28 @@ def main_worker():
         if total_frames <= max_frames_per_segment:
             print(f"\n✓ 视频较短，无需分段，直接处理")
             print("="*60 + "\n")
-            process_single_video(args.video)
+            result = process_single_video(video_to_process, regions_to_use=regions_for_processing)
+
+            # 如果是裁剪模式，需要overlay回原视频
+            if crop_mode:
+                print("\n" + "="*60)
+                print("步骤3: 合并到原视频")
+                print("="*60)
+                final_output = args.output if args.output else os.path.join("output", f"{os.path.splitext(os.path.basename(original_video))[0]}_inpainted_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4")
+
+                merge_video_ffmpeg(original_video, result, final_output, crop_x, crop_y)
+                print(f"✓ 合并完成: {final_output}")
+
+                # 清理临时文件
+                try:
+                    if os.path.exists(cropped_video):
+                        os.remove(cropped_video)
+                    if os.path.exists(result):
+                        os.remove(result)
+                except:
+                    pass
+
+                print("="*60)
             return
 
         # 需要分段处理
@@ -1235,11 +1279,11 @@ def main_worker():
         temp_dir = os.path.join(output_base, f"temp_segments_{timestamp}")
         os.makedirs(temp_dir, exist_ok=True)
 
-        # 分段切割视频
+        # 分段切割视频（切割已裁剪的视频）
         print("="*60)
         print("分段切割视频")
         print("="*60)
-        segment_files = split_video_by_time(args.video, temp_dir, segment_duration, video_fps)
+        segment_files = split_video_by_time(video_to_process, temp_dir, segment_duration, video_fps)
         print(f"✓ 完成分段切割: {len(segment_files)} 个片段")
         print("="*60 + "\n")
 
@@ -1253,7 +1297,7 @@ def main_worker():
             segment_output = os.path.join(temp_dir, f"processed_{idx:04d}.mp4")
 
             try:
-                process_single_video(segment_file, output_path_override=segment_output)
+                process_single_video(segment_file, regions_to_use=regions_for_processing, output_path_override=segment_output)
                 processed_files.append(segment_output)
                 print(f"✓ 片段 {idx} 处理完成")
             except Exception as e:
@@ -1265,16 +1309,45 @@ def main_worker():
         print("合并所有片段")
         print("="*60)
 
-        # 确定最终输出路径
-        if args.output:
-            final_output = args.output
-        else:
-            video_name = os.path.splitext(os.path.basename(args.video))[0]
-            final_output = os.path.join(output_base, f"{video_name}_inpainted_{timestamp}.mp4")
-
-        concat_videos_ffmpeg(processed_files, final_output)
-        print(f"✓ 合并完成: {final_output}")
+        # 合并后的临时输出
+        merged_output = os.path.join(temp_dir, "merged_result.mp4")
+        concat_videos_ffmpeg(processed_files, merged_output)
+        print(f"✓ 片段合并完成: {merged_output}")
         print("="*60 + "\n")
+
+        # ========== 第3步：如果是裁剪模式，overlay回原视频 ==========
+        if crop_mode:
+            print("="*60)
+            print("步骤3: 合并到原视频")
+            print("="*60)
+
+            if args.output:
+                final_output = args.output
+            else:
+                video_name = os.path.splitext(os.path.basename(original_video))[0]
+                final_output = os.path.join(output_base, f"{video_name}_inpainted_{timestamp}.mp4")
+
+            print(f"原视频: {original_video}")
+            print(f"修复区域: {merged_output}")
+            print(f"最终输出: {final_output}")
+            print(f"Overlay位置: x={crop_x}, y={crop_y}")
+
+            merge_video_ffmpeg(original_video, merged_output, final_output, crop_x, crop_y)
+            print(f"✓ 合并完成: {final_output}")
+            print("="*60 + "\n")
+        else:
+            # 非裁剪模式，直接作为最终输出
+            if args.output:
+                final_output = args.output
+            else:
+                video_name = os.path.splitext(os.path.basename(original_video))[0]
+                final_output = os.path.join(output_base, f"{video_name}_inpainted_{timestamp}.mp4")
+
+            # 移动merged_output到final_output
+            import shutil
+            shutil.move(merged_output, final_output)
+            print(f"✓ 输出: {final_output}")
+            print("="*60 + "\n")
 
         # 清理临时文件
         print("="*60)
@@ -1284,17 +1357,22 @@ def main_worker():
             for segment_file in segment_files:
                 if os.path.exists(segment_file):
                     os.remove(segment_file)
-                    print(f"✓ 删除: {os.path.basename(segment_file)}")
+                    print(f"✓ 删除分段: {os.path.basename(segment_file)}")
 
             for processed_file in processed_files:
                 if os.path.exists(processed_file):
                     os.remove(processed_file)
-                    print(f"✓ 删除: {os.path.basename(processed_file)}")
+                    print(f"✓ 删除处理结果: {os.path.basename(processed_file)}")
+
+            # 如果是裁剪模式，删除裁剪的中间视频
+            if crop_mode and cropped_video and os.path.exists(cropped_video):
+                os.remove(cropped_video)
+                print(f"✓ 删除裁剪视频: {os.path.basename(cropped_video)}")
 
             # 删除临时目录
             if os.path.exists(temp_dir) and not os.listdir(temp_dir):
                 os.rmdir(temp_dir)
-                print(f"✓ 删除临时目录: {temp_dir}")
+                print(f"✓ 删除临时目录: {os.path.basename(temp_dir)}")
         except Exception as e:
             print(f"⚠️  清理临时文件失败: {e}")
 
@@ -1306,8 +1384,44 @@ def main_worker():
         print(f"📊 处理了 {len(segment_files)} 个片段，共 {total_frames} 帧")
         print("="*60)
     else:
-        # 正常处理（不分段）
-        process_single_video(args.video)
+        # 正常处理（不分段，但可能有裁剪）
+        result = process_single_video(video_to_process, regions_to_use=regions_for_processing)
+
+        # 如果是裁剪模式，需要overlay回原视频
+        if crop_mode:
+            print("\n" + "="*60)
+            print("合并到原视频")
+            print("="*60)
+
+            if args.output:
+                final_output = args.output
+            else:
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                video_name = os.path.splitext(os.path.basename(original_video))[0]
+                final_output = os.path.join("output", f"{video_name}_inpainted_{timestamp}.mp4")
+
+            print(f"原视频: {original_video}")
+            print(f"修复区域: {result}")
+            print(f"最终输出: {final_output}")
+            print(f"Overlay位置: x={crop_x}, y={crop_y}")
+
+            merge_video_ffmpeg(original_video, result, final_output, crop_x, crop_y)
+            print(f"✓ 合并完成: {final_output}")
+
+            # 清理临时文件
+            try:
+                if os.path.exists(cropped_video):
+                    os.remove(cropped_video)
+                if os.path.exists(result):
+                    os.remove(result)
+            except:
+                pass
+
+            print("="*60 + "\n")
+            print("="*60)
+            print("🎉 全部完成！")
+            print(f"📹 最终输出: {final_output}")
+            print("="*60)
 
 
 if __name__ == '__main__':
