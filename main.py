@@ -203,7 +203,31 @@ def setup_resolution(video_path, resolution_arg=None, scale=1.0, short_side=None
     w = w if w % 2 == 0 else w + 1
     h = h if h % 2 == 0 else h + 1
 
-    # 4. 显示显存估算（这里还不知道视频帧数）
+    # 4. 确保分辨率匹配模型patchsize要求
+    # 模型patchsize硬编码为 [(108, 60), ...], 针对432x240设计
+    # 处理分辨率必须是432x240的倍数
+    base_w, base_h = 432, 240
+
+    # 计算最接近的合法分辨率
+    w_ratio = w / base_w
+    h_ratio = h / base_h
+
+    # 向下取整到最接近的倍数（保守策略，避免显存超标）
+    w_mult = max(1, int(w_ratio))
+    h_mult = max(1, int(h_ratio))
+
+    # 如果原始分辨率不匹配，调整它
+    adjusted_w = base_w * w_mult
+    adjusted_h = base_h * h_mult
+
+    if adjusted_w != w or adjusted_h != h:
+        print(f"\n⚠️  分辨率调整:")
+        print(f"   原分辨率: {w}x{h}")
+        print(f"   调整后: {adjusted_w}x{adjusted_h}")
+        print(f"   原因: 模型要求分辨率必须是 {base_w}x{base_h} 的倍数")
+        w, h = adjusted_w, adjusted_h
+
+    # 5. 显示显存估算（这里还不知道视频帧数）
     estimate_memory(w, h)
 
     return w, h, default_fps
@@ -403,6 +427,38 @@ def calculate_crop_region(regions, video_width, video_height, padding=32):
     # 确保尺寸是偶数
     crop_w = crop_w if crop_w % 2 == 0 else crop_w - 1
     crop_h = crop_h if crop_h % 2 == 0 else crop_h - 1
+
+    # 确保裁剪尺寸匹配模型patchsize要求（432x240的倍数）
+    base_w, base_h = 432, 240
+
+    # 向下对齐到432x240的倍数
+    w_mult = max(1, crop_w // base_w)
+    h_mult = max(1, crop_h // base_h)
+
+    aligned_w = base_w * w_mult
+    aligned_h = base_h * h_mult
+
+    # 如果太小，至少用1倍的基础尺寸
+    if aligned_w < base_w:
+        aligned_w = base_w
+    if aligned_h < base_h:
+        aligned_h = base_h
+
+    # 调整裁剪区域（居中裁剪）
+    if aligned_w != crop_w or aligned_h != crop_h:
+        w_diff = crop_w - aligned_w
+        h_diff = crop_h - aligned_h
+
+        # 调整起始位置（保持居中）
+        x1_pixel += w_diff // 2
+        y1_pixel += h_diff // 2
+
+        # 确保不超出边界
+        x1_pixel = max(0, min(x1_pixel, video_width - aligned_w))
+        y1_pixel = max(0, min(y1_pixel, video_height - aligned_h))
+
+        crop_w = aligned_w
+        crop_h = aligned_h
 
     return (x1_pixel, y1_pixel, crop_w, crop_h), (min_left, min_bottom, max_right, max_top)
 
