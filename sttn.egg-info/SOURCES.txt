@@ -1,0 +1,16 @@
+LICENSE
+README.md
+pyproject.toml
+core/dataset.py
+core/dist.py
+core/loss.py
+core/spectral_norm.py
+core/trainer.py
+core/utils.py
+model/sttn.py
+model/vis.py
+sttn.egg-info/PKG-INFO
+sttn.egg-info/SOURCES.txt
+sttn.egg-info/dependency_links.txt
+sttn.egg-info/requires.txt
+sttn.egg-info/top_level.txt

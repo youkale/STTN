@@ -1,0 +1,217 @@
+Metadata-Version: 2.4
+Name: sttn
+Version: 0.2.0
+Summary: Spatial-Temporal Transformer Network - Python 3.10 compatible version
+Author: STTN Contributors
+License: The MIT License (MIT)
+        
+        Copyright (c) 2016 Michael Rose
+        
+        Permission is hereby granted, free of charge, to any person obtaining a copy
+        of this software and associated documentation files (the "Software"), to deal
+        in the Software without restriction, including without limitation the rights
+        to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+        copies of the Software, and to permit persons to whom the Software is
+        furnished to do so, subject to the following conditions:
+        
+        The above copyright notice and this permission notice shall be included in all
+        copies or substantial portions of the Software.
+        
+        THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+        IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+        FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+        AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+        LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+        OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+        SOFTWARE.
+Project-URL: Homepage, https://github.com/researchmm/STTN
+Project-URL: Repository, https://github.com/researchmm/STTN
+Project-URL: Documentation, https://github.com/researchmm/STTN/blob/master/README.md
+Keywords: video-inpainting,deep-learning,pytorch,transformer
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Science/Research
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Requires-Python: <3.13,>=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: torch<2.5.0,>=1.13.0
+Requires-Dist: torchvision<0.20.0,>=0.14.0
+Requires-Dist: numpy<2.0.0,>=1.21.0
+Requires-Dist: scipy<2.0.0,>=1.7.3
+Requires-Dist: scikit-image<0.25.0,>=0.19.0
+Requires-Dist: scikit-learn<1.6.0,>=1.0.0
+Requires-Dist: opencv-python<5.0.0,>=4.5.4
+Requires-Dist: pillow<11.0.0,>=9.0.0
+Requires-Dist: imageio<3.0.0,>=2.9.0
+Requires-Dist: pandas<3.0.0,>=1.3.5
+Requires-Dist: h5py<4.0.0,>=3.6.0
+Requires-Dist: lmdb<2.0.0,>=1.2.1
+Requires-Dist: matplotlib<4.0.0,>=3.5.0
+Requires-Dist: tensorboard<3.0.0,>=2.8.0
+Requires-Dist: tensorboardX<3.0.0,>=2.5.0
+Requires-Dist: tqdm<5.0.0,>=4.62.0
+Requires-Dist: ipython<9.0.0,>=8.0.0
+Requires-Dist: ipykernel<7.0.0,>=6.9.0
+Requires-Dist: jupyter<2.0.0,>=1.0.0
+Requires-Dist: notebook<8.0.0,>=6.4.8
+Requires-Dist: pyyaml<7.0.0,>=6.0.0
+Requires-Dist: requests<3.0.0,>=2.27.0
+Requires-Dist: tifffile<2025.0.0,>=2021.11.2
+Requires-Dist: pywavelets<2.0.0,>=1.2.0
+Requires-Dist: pytest<9.0.0,>=7.0.0
+Requires-Dist: black<25.0.0,>=22.0.0
+Requires-Dist: flake8<8.0.0,>=4.0.0
+Provides-Extra: cuda
+Requires-Dist: cupy-cuda11x<14.0.0,>=11.0.0; extra == "cuda"
+Provides-Extra: cuda12
+Requires-Dist: cupy-cuda12x<14.0.0,>=12.0.0; extra == "cuda12"
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0.0; extra == "dev"
+Requires-Dist: pytest-cov>=3.0.0; extra == "dev"
+Requires-Dist: black>=22.0.0; extra == "dev"
+Requires-Dist: flake8>=4.0.0; extra == "dev"
+Requires-Dist: isort>=5.10.0; extra == "dev"
+Requires-Dist: mypy>=0.931; extra == "dev"
+Provides-Extra: all
+Requires-Dist: sttn[cuda12,dev]; extra == "all"
+Dynamic: license-file
+
+# STTN for Video Inpainting
+![teaser](https://github.com/researchmm/STTN/blob/master/docs/teaser.png?raw=true)
+
+### [Paper](https://arxiv.org/abs/2007.10247) | [Project](https://sites.google.com/view/1900zyh/sttn) | [Slides](https://drive.google.com/file/d/1y09-SLcTadqpuDDLSzFdtr3ymGbjrmyi/view?usp=sharing) |[BibTex](https://github.com/researchmm/STTN#citation)
+
+Learning Joint Spatial-Temporal Transformations for Video Inpainting<br>
+
+[Yanhong Zeng](https://sites.google.com/view/1900zyh),  [Jianlong Fu](https://jianlong-fu.github.io/), and [Hongyang Chao](https://scholar.google.com/citations?user=qnbpG6gAAAAJ&hl).<br>
+In ECCV 2020.
+
+
+<!-- ---------------------------------------------- -->
+## Citation
+If any part of our paper and repository is helpful to your work, please generously cite with:
+```
+@inproceedings{yan2020sttn,
+  author = {Zeng, Yanhong and Fu, Jianlong and Chao, Hongyang,
+  title = {Learning Joint Spatial-Temporal Transformations for Video Inpainting},
+  booktitle = {The Proceedings of the European Conference on Computer Vision (ECCV)},
+  year = {2020}
+}
+```
+
+<!-- ---------------------------------------------- -->
+## Introduction 
+High-quality video inpainting that completes missing regions in video frames is a promising yet challenging task. 
+
+In this paper, we propose to learn a joint Spatial-Temporal Transformer Network (STTN) for video inpainting. Specifically, we simultaneously fill missing regions in all input frames by the proposed multi-scale patch-based attention modules. STTN is optimized by a spatial-temporal adversarial loss. 
+
+To show the superiority of the proposed model, we conduct both quantitative and qualitative evaluations by using standard stationary masks and more realistic moving object masks.
+
+![STTN](https://github.com/researchmm/STTN/blob/master/docs/sttn.png?raw=true)
+
+
+<!-- ---------------------------------------------- -->
+## Installation  
+
+Clone this repo.
+
+```
+git clone git@github.com:researchmm/STTN.git
+cd STTN/
+```
+
+We build our project based on Pytorch and Python. For the full set of required Python packages, we suggest create a Conda environment from the provided YAML, e.g.
+
+```
+conda env create -f environment.yml 
+conda activate sttn
+```
+
+<!-- ---------------------------------------------- -->
+## Completing Videos Using Pretrained Model
+
+The result videos can be generated using pretrained models. 
+For your reference, we provide a model pretrained on Youtube-VOS([Google Drive Folder](https://drive.google.com/file/d/1ZAMV8547wmZylKRt5qR_tC5VlosXD4Wv/view?usp=sharing)). 
+
+1. Download the pretrained models from the [Google Drive Folder](https://drive.google.com/file/d/1ZAMV8547wmZylKRt5qR_tC5VlosXD4Wv/view?usp=sharing), save it in ```checkpoints/```. 
+
+2. Complete videos using the pretrained model. For example, 
+
+```
+python test.py --video examples/schoolgirls_orig.mp4 --mask examples/schoolgirls  --ckpt checkpoints/sttn.pth 
+```
+The outputs videos are saved at ```examples/```. 
+
+
+<!-- ---------------------------------------------- -->
+## Dataset Preparation
+
+We provide dataset split in ```datasets/```. 
+
+**Preparing Youtube-VOS (2018) Dataset.** The dataset can be downloaded from [here](https://competitions.codalab.org/competitions/19544#participate-get-data). In particular, we follow the standard train/validation/test split (3,471/474/508). The dataset should be arranged in the same directory structure as 
+
+```
+datasets
+    ｜- youtube-vos
+        |- JPEGImages
+           |- <video_id>.zip
+           |- <video_id>.zip
+        |- test.json 
+        |- train.json 
+``` 
+
+**Preparing DAVIS (2018) Dataset.** The dataset can be downloaded from [here](https://davischallenge.org/davis2017/code.html). In particular, there are 90 videos with densely-annotated object masks and 60 videos without annotations. The dataset should be arranged in the same directory structure as
+
+```
+datasets
+    ｜- davis
+        |- JPEGImages
+          |- cows.zip
+          |- goat.zip
+        |- Annoatations
+          |- cows.zip
+          |- goat.zip
+        |- test.json 
+        |- train.json 
+``` 
+
+
+<!-- ---------------------------------------------- -->
+## Training New Models
+Once the dataset is ready, new models can be trained with the following commands. For example, 
+
+```
+python train.py --config configs/youtube-vos.json --model sttn 
+```
+
+<!-- ---------------------------------------------- -->
+## Testing
+
+Testing is similar to [Completing Videos Using Pretrained Model](https://github.com/researchmm/STTN#completing-videos-using-pretrained-model).
+
+```
+python test.py --video examples/schoolgirls_orig.mp4 --mask examples/schoolgirls  --ckpt checkpoints/sttn.pth 
+```
+The outputs videos are saved at ```examples/```. 
+
+<!-- ---------------------------------------------- -->
+## Visualization 
+
+We provide an example of visualization attention maps in ```visualization.ipynb```. 
+
+
+<!-- ---------------------------------------------- -->
+## Training Monitoring  
+
+We provide traning monitoring on losses by running: 
+```
+tensorboard --logdir release_mode                                                    
+```
+
+<!-- ---------------------------------------------- -->
+## Contact
+If you have any questions or suggestions about this paper, feel free to contact me (zengyh7@mail2.sysu.edu.cn).

@@ -109,8 +109,9 @@ class ToTorchFormatTensor(object):
             img = torch.from_numpy(pic).permute(2, 3, 0, 1).contiguous()
         else:
             # handle PIL Image
-            img = torch.ByteTensor(
-                torch.ByteStorage.from_buffer(pic.tobytes()))
+            # Fixed for PyTorch 2.0+: torch.ByteStorage.from_buffer is deprecated
+            # Use frombuffer instead
+            img = torch.frombuffer(pic.tobytes(), dtype=torch.uint8)
             img = img.view(pic.size[1], pic.size[0], len(pic.mode))
             # put it from HWC to CHW format
             # yikes, this transpose takes 80% of the loading time/CPU
@@ -154,12 +155,12 @@ def create_random_shape_with_random_motion(video_length, imageHeight=240, imageW
 
 def get_random_shape(edge_num=9, ratio=0.7, width=432, height=240):
     '''
-      There is the initial point and 3 points per cubic bezier curve. 
+      There is the initial point and 3 points per cubic bezier curve.
       Thus, the curve will only pass though n points, which will be the sharp edges.
       The other 2 modify the shape of the bezier curve.
       edge_num, Number of possibly sharp edges
       points_num, number of points in the Path
-      ratio, (0, 1) magnitude of the perturbation from the unit circle, 
+      ratio, (0, 1) magnitude of the perturbation from the unit circle,
     '''
     points_num = edge_num*3 + 1
     angles = np.linspace(0, 2*np.pi, points_num)
@@ -250,4 +251,3 @@ if __name__ == '__main__':
         for m in masks:
             cv2.imshow('mask', np.array(m))
             cv2.waitKey(500)
-
