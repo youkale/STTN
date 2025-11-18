@@ -501,35 +501,52 @@ def merge_video_ffmpeg(original_video, inpainted_video, output_video, x, y):
     return output_video
 
 
-def calculate_max_frames(width, height, gpu_memory_gb, safety_margin=0.8):
+def calculate_max_frames(width, height, gpu_memory_gb, safety_margin=0.5):
     """
     计算给定显存下可处理的最大帧数
 
     参数:
         width, height: 视频分辨率
         gpu_memory_gb: GPU显存大小(GB)
-        safety_margin: 安全系数(0-1)，默认0.8
+        safety_margin: 安全系数(0-1)，默认0.5（保守估计，考虑编码器中间激活）
 
     返回:
         max_frames: 最大帧数
     """
     feat_h, feat_w = height // 4, width // 4
 
-    # 每帧显存占用
-    per_frame_gb = (
-        256 * feat_h * feat_w * 4 +  # feats
+    # 每帧显存占用（静态数据）
+    per_frame_static = (
+        256 * feat_h * feat_w * 4 +  # feats（编码后）
         height * width * 4 +           # masks
-        height * width * 3             # frames
+        height * width * 3             # frames（RGB）
     ) / (1024**3)
 
-    overhead_gb = 1.5  # 模型权重 + 中间变量
+    # 编码器中间激活值（临时占用，非常大！）
+    # Conv层会产生多层中间feature maps
+    # 估算: input(3 ch) -> 64 -> 64 -> 128 -> 256
+    encoder_temp_per_frame = (
+        (3 + 64 + 64 + 128 + 256) * height * width * 4
+    ) / (1024**3)
 
-    # 可用显存
+    # 总每帧显存 = 静态 + 编码临时开销的50%（因为不是所有层同时存在）
+    per_frame_total = per_frame_static + encoder_temp_per_frame * 0.5
+
+    overhead_gb = 2.0  # 模型权重(1.5GB) + transformer开销(0.5GB)
+
+    # 可用显存（更保守）
     available_gb = gpu_memory_gb * safety_margin - overhead_gb
 
-    max_frames = int(available_gb / per_frame_gb)
+    if available_gb <= 0:
+        print(f"⚠️  警告: 显存不足以处理，使用最小帧数")
+        return 10
 
-    return max(max_frames, 10)  # 至少10帧
+    max_frames = int(available_gb / per_frame_total)
+
+    # 设置合理上下限
+    max_frames = max(10, min(max_frames, 150))  # 10-150帧之间
+
+    return max_frames
 
 
 def split_video_by_time(input_video, output_dir, segment_duration, fps):
@@ -918,11 +935,34 @@ def process_single_video(video_path, output_path_override=None):
     print("="*60)
     print("编码视频特征")
     print("="*60)
+
+    # 释放不必要的显存
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     with torch.no_grad():
-        feats = model.encoder((feats*(1-masks).float()).view(video_length, 3, h, w))
-        _, c, feat_h, feat_w = feats.size()
-        feats = feats.view(1, video_length, c, feat_h, feat_w)
+        try:
+            feats = model.encoder((feats*(1-masks).float()).view(video_length, 3, h, w))
+            _, c, feat_h, feat_w = feats.size()
+            feats = feats.view(1, video_length, c, feat_h, feat_w)
+        except torch.cuda.OutOfMemoryError as e:
+            print(f"\n❌ 编码阶段显存不足！")
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated(0) / (1024**3)
+                total = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                print(f"   已用: {allocated:.2f}GB / {total:.1f}GB")
+            print(f"\n当前片段帧数: {video_length}")
+            print(f"建议使用 --max-frames {video_length // 2} 减少每段帧数")
+            raise
+
     print(f'✓ 特征编码完成: {video_length} 帧')
+
+    # 编码完成后释放显存
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        allocated = torch.cuda.memory_allocated(0) / (1024**3)
+        print(f'  编码后显存: {allocated:.2f}GB')
+
     print("="*60 + "\n")
 
     # 修复视频
