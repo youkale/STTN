@@ -358,7 +358,12 @@ def main_worker():
     print("="*60 + "\n")
 
     # set up models
-    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        print(f"✓ 使用设备: {device} (GPU: {torch.cuda.get_device_name(0)})")
+    else:
+        device = torch.device("cpu")
+        print(f"✓ 使用设备: CPU")
     net = importlib.import_module('src.model.' + args.model)
     model = net.InpaintGenerator().to(device)
     model_path = args.ckpt
