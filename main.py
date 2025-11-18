@@ -734,9 +734,10 @@ def generate_masks_from_regions(video_path, regions, num_frames=None):
     vidcap.release()
 
     print(f"视频原始尺寸: {orig_width}x{orig_height}")
-    print(f"处理尺寸: {w}x{h}")
+    print(f"处理尺寸(全局w,h): {w}x{h}")
     print(f"视频总帧数: {num_frames}")
     print(f"区域数量: {len(regions)}")
+    print(f"输入regions: {regions}")
 
     # 创建output目录下的mask子目录
     output_base = "output"
@@ -780,8 +781,9 @@ def generate_masks_from_regions(video_path, regions, num_frames=None):
         # 绘制白色区域
         mask[y1:y2, x1:x2] = 255
 
-        print(f"  区域 [left={left}, bottom={bottom}, right={right}, top={top}]")
-        print(f"    -> 像素坐标: x=[{x1},{x2}], y=[{y1},{y2}] (图像坐标系)")
+        print(f"  区域 [left={left:.4f}, bottom={bottom:.4f}, right={right:.4f}, top={top:.4f}]")
+        print(f"    -> 像素坐标: x=[{x1},{x2}] (宽度={x2-x1}), y=[{y1},{y2}] (高度={y2-y1})")
+        print(f"    -> mask尺寸: {mask.shape}, 白色像素数: {np.sum(mask == 255)}")
 
     # 应用膨胀操作（与read_mask保持一致）
     mask = cv2.dilate(mask, cv2.getStructuringElement(
@@ -842,9 +844,27 @@ def process_single_video(video_path, output_path_override=None):
         print(f"  显存降低: ~{(orig_w*orig_h)/(crop_w*crop_h):.1f}x")
 
         # 转换regions到裁剪空间
-        transformed_regions = transform_regions_to_crop_space(
-            regions, crop_bounds, orig_w, orig_h, crop_w, crop_h
+        # 注意：这里crop_w, crop_h已经是对齐后的尺寸，需要重新计算crop_bounds
+        # 因为裁剪区域可能被调整过，需要基于实际裁剪尺寸重新计算边界
+        actual_crop_bounds = (
+            crop_x / orig_w,  # min_left
+            crop_y / orig_h,  # min_bottom (但这是图像坐标系，需要转换)
+            (crop_x + crop_w) / orig_w,  # max_right
+            (crop_y + crop_h) / orig_h   # max_top
         )
+
+        # 但Y坐标系需要转换（crop_y是图像坐标系，从上往下）
+        actual_crop_bounds = (
+            crop_x / orig_w,  # min_left
+            1 - (crop_y + crop_h) / orig_h,  # min_bottom (左下角坐标系)
+            (crop_x + crop_w) / orig_w,  # max_right
+            1 - crop_y / orig_h  # max_top (左下角坐标系)
+        )
+
+        transformed_regions = transform_regions_to_crop_space(
+            regions, actual_crop_bounds, orig_w, orig_h, crop_w, crop_h
+        )
+        print(f"  实际裁剪边界(左下角坐标): {actual_crop_bounds}")
         print(f"  转换后区域: {transformed_regions}")
 
         # 裁剪视频
