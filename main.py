@@ -45,6 +45,10 @@ parser.add_argument("--crop", action="store_true",
                     help="裁剪模式：仅处理区域周围部分，大幅降低显存占用（需配合--regions使用）")
 parser.add_argument("--crop-padding", type=int, default=32,
                     help="裁剪时的边界padding（像素），避免边界artifacts，默认32")
+parser.add_argument("--auto-split", action="store_true",
+                    help="自动分段处理：根据显存大小自动切分视频，逐段处理后合并")
+parser.add_argument("--max-frames", type=int,
+                    help="每段最大帧数（配合--auto-split使用），不指定则自动计算")
 args = parser.parse_args()
 
 
@@ -497,6 +501,135 @@ def merge_video_ffmpeg(original_video, inpainted_video, output_video, x, y):
     return output_video
 
 
+def calculate_max_frames(width, height, gpu_memory_gb, safety_margin=0.8):
+    """
+    计算给定显存下可处理的最大帧数
+
+    参数:
+        width, height: 视频分辨率
+        gpu_memory_gb: GPU显存大小(GB)
+        safety_margin: 安全系数(0-1)，默认0.8
+
+    返回:
+        max_frames: 最大帧数
+    """
+    feat_h, feat_w = height // 4, width // 4
+
+    # 每帧显存占用
+    per_frame_gb = (
+        256 * feat_h * feat_w * 4 +  # feats
+        height * width * 4 +           # masks
+        height * width * 3             # frames
+    ) / (1024**3)
+
+    overhead_gb = 1.5  # 模型权重 + 中间变量
+
+    # 可用显存
+    available_gb = gpu_memory_gb * safety_margin - overhead_gb
+
+    max_frames = int(available_gb / per_frame_gb)
+
+    return max(max_frames, 10)  # 至少10帧
+
+
+def split_video_by_time(input_video, output_dir, segment_duration, fps):
+    """
+    按时间分段切割视频
+
+    参数:
+        input_video: 输入视频路径
+        output_dir: 输出目录
+        segment_duration: 每段时长(秒)
+        fps: 视频帧率
+
+    返回:
+        segment_files: 分段文件路径列表
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 获取视频总时长
+    cmd = [
+        'ffprobe', '-v', 'error',
+        '-show_entries', 'format=duration',
+        '-of', 'default=noprint_wrappers=1:nokey=1',
+        input_video
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    total_duration = float(result.stdout.strip())
+
+    print(f"视频总时长: {total_duration:.1f}秒")
+    print(f"分段时长: {segment_duration:.1f}秒")
+
+    segment_files = []
+    segment_idx = 0
+    start_time = 0
+
+    while start_time < total_duration:
+        output_file = os.path.join(output_dir, f"segment_{segment_idx:04d}.mp4")
+
+        cmd = [
+            'ffmpeg', '-y',
+            '-ss', str(start_time),
+            '-i', input_video,
+            '-t', str(segment_duration),
+            '-c', 'copy',
+            output_file
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"视频分段失败: {result.stderr}")
+
+        segment_files.append(output_file)
+        print(f"  ✓ 分段 {segment_idx}: {start_time:.1f}s - {min(start_time + segment_duration, total_duration):.1f}s")
+
+        start_time += segment_duration
+        segment_idx += 1
+
+    return segment_files
+
+
+def concat_videos_ffmpeg(video_files, output_video):
+    """
+    使用ffmpeg合并多个视频
+
+    参数:
+        video_files: 视频文件路径列表
+        output_video: 输出视频路径
+    """
+    # 创建临时文件列表
+    concat_list = output_video.replace('.mp4', '_concat.txt')
+
+    with open(concat_list, 'w') as f:
+        for video_file in video_files:
+            # 使用绝对路径避免问题
+            abs_path = os.path.abspath(video_file)
+            f.write(f"file '{abs_path}'\n")
+
+    cmd = [
+        'ffmpeg', '-y',
+        '-f', 'concat',
+        '-safe', '0',
+        '-i', concat_list,
+        '-c', 'copy',
+        output_video
+    ]
+
+    print(f"合并命令: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    # 清理临时文件列表
+    try:
+        os.remove(concat_list)
+    except:
+        pass
+
+    if result.returncode != 0:
+        raise RuntimeError(f"视频合并失败: {result.stderr}")
+
+    return output_video
+
+
 def generate_masks_from_regions(video_path, regions, num_frames=None):
     """
     根据区域坐标生成mask图片，保存到output目录
@@ -590,20 +723,22 @@ def generate_masks_from_regions(video_path, regions, num_frames=None):
     return mask_dir
 
 
-def main_worker():
-    # 验证参数
-    if args.mask is None and args.regions is None:
-        raise ValueError("必须指定 --mask 或 --regions 参数之一")
-    if args.mask is not None and args.regions is not None:
-        raise ValueError("--mask 和 --regions 参数不能同时使用")
-    if args.crop and args.regions is None:
-        raise ValueError("--crop 模式必须配合 --regions 使用")
+def process_single_video(video_path, output_path_override=None):
+    """
+    处理单个视频（用于主流程和分段处理）
 
+    参数:
+        video_path: 输入视频路径
+        output_path_override: 强制指定输出路径（用于分段处理）
+
+    返回:
+        output_path: 输出视频路径
+    """
     # 裁剪模式变量
     crop_mode = args.crop and args.regions is not None
     cropped_video = None
     crop_x, crop_y = 0, 0
-    original_video = args.video
+    original_video = video_path
 
     # 裁剪模式处理
     if crop_mode:
@@ -822,7 +957,9 @@ def main_worker():
     print("="*60 + "\n")
 
     # 确定输出路径
-    if args.output:
+    if output_path_override:
+        final_output_path = output_path_override
+    elif args.output:
         final_output_path = args.output
     else:
         # 默认输出到output目录
@@ -835,7 +972,7 @@ def main_worker():
             final_output_path = os.path.join(output_base, f"{mask_basename}_result.mp4")
         else:
             # 使用视频名称
-            video_name = os.path.splitext(os.path.basename(args.video))[0]
+            video_name = os.path.splitext(os.path.basename(video_path))[0]
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             final_output_path = os.path.join(output_base, f"{video_name}_inpainted_{timestamp}.mp4")
 
@@ -900,6 +1037,161 @@ def main_worker():
     print(f"📹 最终输出: {final_output_path}")
     print("="*60)
 
+    return final_output_path
+
+
+def main_worker():
+    """主工作流程：处理完整视频或自动分段处理"""
+
+    # 验证参数
+    if args.mask is None and args.regions is None:
+        raise ValueError("必须指定 --mask 或 --regions 参数之一")
+    if args.mask is not None and args.regions is not None:
+        raise ValueError("--mask 和 --regions 参数不能同时使用")
+    if args.crop and args.regions is None:
+        raise ValueError("--crop 模式必须配合 --regions 使用")
+
+    # 自动分段模式
+    if args.auto_split:
+        print("\n" + "="*60)
+        print("🔄 自动分段处理模式")
+        print("="*60)
+
+        # 获取视频信息
+        video_info = get_video_info_ffprobe(args.video)
+        if video_info is None:
+            video_info = get_video_info_opencv(args.video)
+        video_w, video_h, video_fps = video_info
+
+        # 获取视频帧数
+        vidcap = cv2.VideoCapture(args.video)
+        total_frames = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
+        vidcap.release()
+
+        print(f"视频信息: {video_w}x{video_h}, {total_frames}帧, {video_fps}fps")
+
+        # 计算每段最大帧数
+        if args.max_frames:
+            max_frames_per_segment = args.max_frames
+            print(f"使用指定的最大帧数: {max_frames_per_segment}")
+        else:
+            # 自动计算
+            if torch.cuda.is_available():
+                gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            else:
+                gpu_memory_gb = 8  # CPU模式默认
+
+            # 如果是裁剪模式，需要先计算裁剪后的尺寸
+            if args.crop and args.regions:
+                regions = json.loads(args.regions)
+                (_, _, crop_w, crop_h), _ = calculate_crop_region(
+                    regions, video_w, video_h, padding=args.crop_padding
+                )
+                max_frames_per_segment = calculate_max_frames(crop_w, crop_h, gpu_memory_gb)
+                print(f"裁剪后尺寸: {crop_w}x{crop_h}")
+            else:
+                max_frames_per_segment = calculate_max_frames(video_w, video_h, gpu_memory_gb)
+
+            print(f"GPU显存: {gpu_memory_gb:.1f}GB")
+            print(f"自动计算最大帧数: {max_frames_per_segment}帧 (~{max_frames_per_segment/video_fps:.1f}秒)")
+
+        # 检查是否需要分段
+        if total_frames <= max_frames_per_segment:
+            print(f"\n✓ 视频较短，无需分段，直接处理")
+            print("="*60 + "\n")
+            process_single_video(args.video)
+            return
+
+        # 需要分段处理
+        num_segments = (total_frames + max_frames_per_segment - 1) // max_frames_per_segment
+        segment_duration = max_frames_per_segment / video_fps
+
+        print(f"\n需要分段处理:")
+        print(f"  总帧数: {total_frames}")
+        print(f"  每段帧数: {max_frames_per_segment}")
+        print(f"  分段数量: {num_segments}")
+        print(f"  每段时长: ~{segment_duration:.1f}秒")
+        print("="*60 + "\n")
+
+        # 创建临时目录
+        output_base = "output"
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        temp_dir = os.path.join(output_base, f"temp_segments_{timestamp}")
+        os.makedirs(temp_dir, exist_ok=True)
+
+        # 分段切割视频
+        print("="*60)
+        print("分段切割视频")
+        print("="*60)
+        segment_files = split_video_by_time(args.video, temp_dir, segment_duration, video_fps)
+        print(f"✓ 完成分段切割: {len(segment_files)} 个片段")
+        print("="*60 + "\n")
+
+        # 逐段处理
+        processed_files = []
+        for idx, segment_file in enumerate(segment_files, 1):
+            print("\n" + "="*60)
+            print(f"处理片段 {idx}/{len(segment_files)}")
+            print("="*60)
+
+            segment_output = os.path.join(temp_dir, f"processed_{idx:04d}.mp4")
+
+            try:
+                process_single_video(segment_file, output_path_override=segment_output)
+                processed_files.append(segment_output)
+                print(f"✓ 片段 {idx} 处理完成")
+            except Exception as e:
+                print(f"❌ 片段 {idx} 处理失败: {e}")
+                raise
+
+        # 合并所有片段
+        print("\n" + "="*60)
+        print("合并所有片段")
+        print("="*60)
+
+        # 确定最终输出路径
+        if args.output:
+            final_output = args.output
+        else:
+            video_name = os.path.splitext(os.path.basename(args.video))[0]
+            final_output = os.path.join(output_base, f"{video_name}_inpainted_{timestamp}.mp4")
+
+        concat_videos_ffmpeg(processed_files, final_output)
+        print(f"✓ 合并完成: {final_output}")
+        print("="*60 + "\n")
+
+        # 清理临时文件
+        print("="*60)
+        print("清理临时文件")
+        print("="*60)
+        try:
+            for segment_file in segment_files:
+                if os.path.exists(segment_file):
+                    os.remove(segment_file)
+                    print(f"✓ 删除: {os.path.basename(segment_file)}")
+
+            for processed_file in processed_files:
+                if os.path.exists(processed_file):
+                    os.remove(processed_file)
+                    print(f"✓ 删除: {os.path.basename(processed_file)}")
+
+            # 删除临时目录
+            if os.path.exists(temp_dir) and not os.listdir(temp_dir):
+                os.rmdir(temp_dir)
+                print(f"✓ 删除临时目录: {temp_dir}")
+        except Exception as e:
+            print(f"⚠️  清理临时文件失败: {e}")
+
+        print("="*60 + "\n")
+
+        print("="*60)
+        print("🎉 全部完成！")
+        print(f"📹 最终输出: {final_output}")
+        print(f"📊 处理了 {len(segment_files)} 个片段，共 {total_frames} 帧")
+        print("="*60)
+    else:
+        # 正常处理（不分段）
+        process_single_video(args.video)
 
 
 if __name__ == '__main__':
