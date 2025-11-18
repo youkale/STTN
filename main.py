@@ -199,65 +199,94 @@ def setup_resolution(video_path, resolution_arg=None, scale=1.0, short_side=None
     w = w if w % 2 == 0 else w + 1
     h = h if h % 2 == 0 else h + 1
 
-    # 4. 显示显存估算
+    # 4. 显示显存估算（这里还不知道视频帧数）
     estimate_memory(w, h)
 
     return w, h, default_fps
 
 
-def estimate_memory(width, height):
+def estimate_memory(width, height, video_length=None):
     """
     估算所需显存
+
+    参数:
+        width, height: 视频分辨率
+        video_length: 视频帧数（用于准确估算）
     """
     pixels = width * height
-    # 粗略估算：每百万像素约需 6GB 显存
-    estimated_gb = (pixels / 1_000_000) * 6
+
+    # 基础估算（假设100帧）
+    base_frames = 100
+    estimated_gb_per_100frames = (pixels / 1_000_000) * 6
 
     print(f"📊 分辨率信息:")
     print(f"   像素数: {pixels:,} ({pixels/1_000_000:.2f}M)")
-    print(f"   估算显存: ~{estimated_gb:.1f}GB")
+
+    if video_length:
+        # 精确估算：考虑实际帧数
+        # 显存占用主要来自：feats + masks + 中间tensor
+        # feats: (1, T, C, H/4, W/4) float32 = T * 256 * (H/4) * (W/4) * 4 bytes
+        # masks: (1, T, 1, H, W) float32 = T * H * W * 4 bytes
+        feat_h, feat_w = height // 4, width // 4
+        feats_gb = (video_length * 256 * feat_h * feat_w * 4) / (1024**3)
+        masks_gb = (video_length * height * width * 4) / (1024**3)
+        frames_gb = (video_length * height * width * 3) / (1024**3)  # RGB
+        overhead_gb = 1.5  # 模型权重 + 中间变量
+
+        estimated_gb = feats_gb + masks_gb + frames_gb + overhead_gb
+
+        print(f"   视频帧数: {video_length}")
+        print(f"   视频时长: ~{video_length/24:.1f}秒 (假设24fps)")
+        print(f"   显存占用估算:")
+        print(f"     - 特征张量: {feats_gb:.2f}GB")
+        print(f"     - Mask张量: {masks_gb:.2f}GB")
+        print(f"     - 帧数据: {frames_gb:.2f}GB")
+        print(f"     - 模型+开销: {overhead_gb:.2f}GB")
+        print(f"   总计: ~{estimated_gb:.1f}GB")
+    else:
+        # 粗略估算（假设100帧）
+        estimated_gb = estimated_gb_per_100frames
+        print(f"   估算显存 (100帧): ~{estimated_gb:.1f}GB")
+        print(f"   ⚠️  实际显存取决于视频长度")
 
     # 检测实际可用显存
     if torch.cuda.is_available():
         gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         print(f"   GPU 总显存: {gpu_memory_gb:.1f}GB")
 
-        if estimated_gb > gpu_memory_gb * 0.8:  # 使用超过 80% 显存
+        if video_length:
+            # 显示当前GPU状态
+            try:
+                torch.cuda.empty_cache()
+                allocated = torch.cuda.memory_allocated(0) / (1024**3)
+                reserved = torch.cuda.memory_reserved(0) / (1024**3)
+                free = gpu_memory_gb - reserved
+                print(f"   当前状态: 已分配 {allocated:.2f}GB, 保留 {reserved:.2f}GB, 可用 {free:.2f}GB")
+            except:
+                pass
+
+        if video_length and estimated_gb > gpu_memory_gb * 0.85:
             print(f"\n   ❌ 错误: 估算显存 ({estimated_gb:.1f}GB) 超过 GPU 容量 ({gpu_memory_gb:.1f}GB)")
-            print(f"   必须降低分辨率！")
-            print(f"\n   推荐配置 (GPU {gpu_memory_gb:.0f}GB):")
 
-            short_side = min(width, height)
-            if gpu_memory_gb < 6:
-                print(f"   --short-side 270  (估算 ~0.8GB)")
-                print(f"   --short-side 360  (估算 ~1.4GB)")
-            elif gpu_memory_gb < 8:
-                print(f"   --short-side 360  (估算 ~1.4GB)")
-                print(f"   --short-side 480  (估算 ~2.5GB)")
-            elif gpu_memory_gb < 12:
-                print(f"   --short-side 480  (估算 ~2.5GB)")
-                print(f"   --short-side 540  (估算 ~3.1GB)")
-            else:
-                print(f"   --short-side 540  (估算 ~3.1GB)")
-                print(f"   --short-side 720  (估算 ~5.5GB)")
+            # 计算建议的最大帧数
+            max_frames = int((gpu_memory_gb * 0.8 - 1.5) / ((256 * (height//4) * (width//4) * 4 + height * width * 4 + height * width * 3) / (1024**3)))
+            max_seconds = max_frames / 24
 
-            print(f"\n   示例命令:")
-            print(f"   python main.py -v video.mp4 -c model.pth --regions '...' --short-side 360")
+            print(f"\n   💡 解决方案:")
+            print(f"   1. 裁剪视频时长: 最多 {max_frames} 帧 (~{max_seconds:.1f}秒)")
+            print(f"      ffmpeg -i input.mp4 -t {int(max_seconds)} output.mp4")
+            print(f"\n   2. 降低分辨率:")
+            print(f"      --short-side 360  或  --short-side 480")
+            print(f"\n   3. 使用裁剪模式 (推荐):")
+            print(f"      --crop  (显存可降低10-40倍)")
             print()
             import sys
             sys.exit(1)
-        elif estimated_gb > gpu_memory_gb * 0.6:  # 使用超过 60% 显存
-            print(f"   ⚠️  警告: 显存使用率可能较高，建议降低分辨率")
+        elif not video_length and estimated_gb > gpu_memory_gb * 0.8:
+            print(f"\n   ⚠️  警告: 基础估算显存可能不足")
+            print(f"   建议使用 --crop 或降低分辨率")
 
-    if estimated_gb > 8:
-        print(f"   💡 建议:")
-        print(f"   方式1: --scale 0.5 (降低到 {width//2}x{height//2})")
-        # 推荐短边尺寸
-        short_side = min(width, height)
-        if short_side > 540:
-            print(f"   方式2: --short-side 540 (推荐用于显存 4-6GB)")
-        if short_side > 720:
-            print(f"   方式3: --short-side 720 (推荐用于显存 6-8GB)")
+    return estimated_gb
 
 
 # sample reference frames from the whole video
@@ -693,6 +722,12 @@ def main_worker():
     frames = read_frame_from_videos(video_to_process)
     video_length = len(frames)
     print(f"✓ 加载 {video_length} 帧")
+
+    # 重新估算显存（现在知道帧数了）
+    print("\n重新估算显存需求:")
+    estimate_memory(w, h, video_length)
+    print()
+
     feats = _to_tensors(frames).unsqueeze(0)*2-1
     frames = [np.array(f).astype(np.uint8) for f in frames]
     print("="*60 + "\n")
@@ -710,7 +745,38 @@ def main_worker():
 
     binary_masks = [np.expand_dims((np.array(m) != 0).astype(np.uint8), 2) for m in masks]
     masks = _to_tensors(masks).unsqueeze(0)
-    feats, masks = feats.to(device), masks.to(device)
+
+    # 显示显存使用情况
+    if torch.cuda.is_available():
+        print("显存状态 (加载前):")
+        torch.cuda.empty_cache()
+        allocated = torch.cuda.memory_allocated(0) / (1024**3)
+        print(f"  已分配: {allocated:.2f}GB")
+
+    # 分步加载到GPU，监控显存
+    print("\n加载数据到GPU...")
+    try:
+        feats = feats.to(device)
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated(0) / (1024**3)
+            print(f"  feats加载后: {allocated:.2f}GB")
+
+        masks = masks.to(device)
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated(0) / (1024**3)
+            print(f"  masks加载后: {allocated:.2f}GB")
+    except torch.cuda.OutOfMemoryError as e:
+        print(f"\n❌ 显存不足！")
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated(0) / (1024**3)
+            total = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            print(f"   已用: {allocated:.2f}GB / {total:.1f}GB")
+        print(f"\n💡 解决方案:")
+        print(f"   1. 缩短视频: ffmpeg -i input.mp4 -t 10 output.mp4  (前10秒)")
+        print(f"   2. 降低分辨率: --short-side 360")
+        print(f"   3. 使用裁剪模式: --crop (强烈推荐！)")
+        raise
+
     comp_frames = [None]*video_length
 
     # 编码特征
