@@ -213,8 +213,40 @@ def estimate_memory(width, height):
     print(f"   像素数: {pixels:,} ({pixels/1_000_000:.2f}M)")
     print(f"   估算显存: ~{estimated_gb:.1f}GB")
 
+    # 检测实际可用显存
+    if torch.cuda.is_available():
+        gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        print(f"   GPU 总显存: {gpu_memory_gb:.1f}GB")
+
+        if estimated_gb > gpu_memory_gb * 0.8:  # 使用超过 80% 显存
+            print(f"\n   ❌ 错误: 估算显存 ({estimated_gb:.1f}GB) 超过 GPU 容量 ({gpu_memory_gb:.1f}GB)")
+            print(f"   必须降低分辨率！")
+            print(f"\n   推荐配置 (GPU {gpu_memory_gb:.0f}GB):")
+
+            short_side = min(width, height)
+            if gpu_memory_gb < 6:
+                print(f"   --short-side 270  (估算 ~0.8GB)")
+                print(f"   --short-side 360  (估算 ~1.4GB)")
+            elif gpu_memory_gb < 8:
+                print(f"   --short-side 360  (估算 ~1.4GB)")
+                print(f"   --short-side 480  (估算 ~2.5GB)")
+            elif gpu_memory_gb < 12:
+                print(f"   --short-side 480  (估算 ~2.5GB)")
+                print(f"   --short-side 540  (估算 ~3.1GB)")
+            else:
+                print(f"   --short-side 540  (估算 ~3.1GB)")
+                print(f"   --short-side 720  (估算 ~5.5GB)")
+
+            print(f"\n   示例命令:")
+            print(f"   python main.py -v video.mp4 -c model.pth --regions '...' --short-side 360")
+            print()
+            import sys
+            sys.exit(1)
+        elif estimated_gb > gpu_memory_gb * 0.6:  # 使用超过 60% 显存
+            print(f"   ⚠️  警告: 显存使用率可能较高，建议降低分辨率")
+
     if estimated_gb > 8:
-        print(f"   ⚠️  警告: 可能需要较大显存，建议降低分辨率")
+        print(f"   💡 建议:")
         print(f"   方式1: --scale 0.5 (降低到 {width//2}x{height//2})")
         # 推荐短边尺寸
         short_side = min(width, height)
@@ -234,18 +266,44 @@ def get_ref_index(neighbor_ids, length):
 
 
 # read frame-wise masks
-def read_mask(mpath):
+def read_mask(mpath, video_length=None):
+    """
+    读取mask图片
+
+    参数:
+        mpath: mask目录路径
+        video_length: 视频总帧数，如果提供且目录只有一张图片，则复用该图片
+
+    返回:
+        masks: mask图片列表
+    """
     masks = []
-    mnames = os.listdir(mpath)
+    mnames = [f for f in os.listdir(mpath) if f.endswith('.png') or f.endswith('.jpg')]
     mnames.sort()
-    for m in mnames:
-        m = Image.open(os.path.join(mpath, m))
+
+    # 如果只有一张mask图片，且指定了视频长度，则复用这张图片
+    if len(mnames) == 1 and video_length is not None:
+        print(f"检测到单张mask，将复用于所有 {video_length} 帧")
+        m = Image.open(os.path.join(mpath, mnames[0]))
         m = m.resize((w, h), Image.NEAREST)
         m = np.array(m.convert('L'))
         m = np.array(m > 0).astype(np.uint8)
         m = cv2.dilate(m, cv2.getStructuringElement(
             cv2.MORPH_CROSS, (3, 3)), iterations=4)
-        masks.append(Image.fromarray(m*255))
+        mask_img = Image.fromarray(m*255)
+        # 复用同一张图片
+        masks = [mask_img] * video_length
+    else:
+        # 逐帧读取
+        for m in mnames:
+            m = Image.open(os.path.join(mpath, m))
+            m = m.resize((w, h), Image.NEAREST)
+            m = np.array(m.convert('L'))
+            m = np.array(m > 0).astype(np.uint8)
+            m = cv2.dilate(m, cv2.getStructuringElement(
+                cv2.MORPH_CROSS, (3, 3)), iterations=4)
+            masks.append(Image.fromarray(m*255))
+
     return masks
 
 
@@ -265,7 +323,7 @@ def read_frame_from_videos(vname):
 
 def generate_masks_from_regions(video_path, regions, num_frames=None):
     """
-    根据区域坐标生成mask图片
+    根据区域坐标生成mask图片，保存到output目录
 
     参数:
         video_path: 视频路径
@@ -278,8 +336,10 @@ def generate_masks_from_regions(video_path, regions, num_frames=None):
         num_frames: 帧数（如果为None则从视频中获取）
 
     返回:
-        masks: mask图片列表
+        mask_dir: mask目录路径
     """
+    import datetime
+
     # 获取视频信息
     vidcap = cv2.VideoCapture(video_path)
 
@@ -293,54 +353,65 @@ def generate_masks_from_regions(video_path, regions, num_frames=None):
 
     print(f"视频原始尺寸: {orig_width}x{orig_height}")
     print(f"处理尺寸: {w}x{h}")
-    print(f"生成 {num_frames} 帧mask，区域数量: {len(regions)}")
+    print(f"视频总帧数: {num_frames}")
+    print(f"区域数量: {len(regions)}")
 
-    masks = []
+    # 创建output目录下的mask子目录
+    output_base = "output"
+    os.makedirs(output_base, exist_ok=True)
 
-    for frame_idx in range(num_frames):
-        # 创建黑色背景 (使用处理尺寸)
-        mask = np.zeros((h, w), dtype=np.uint8)
+    # 使用时间戳创建唯一的mask目录
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    mask_dir = os.path.join(output_base, f"masks_{video_name}_{timestamp}")
+    os.makedirs(mask_dir, exist_ok=True)
+    print(f"Mask目录: {mask_dir}")
 
-        # 在指定区域绘制白色
-        for region in regions:
-            left, bottom, right, top = region
+    # 创建黑色背景 (使用处理尺寸)
+    mask = np.zeros((h, w), dtype=np.uint8)
 
-            # 验证坐标范围
-            if not (0 <= left < right <= 1 and 0 <= bottom < top <= 1):
-                raise ValueError(f"无效的区域坐标: {region}，坐标必须在[0,1]范围内且left<right, bottom<top")
+    # 在指定区域绘制白色
+    for region in regions:
+        left, bottom, right, top = region
 
-            # 转换相对坐标到实际像素坐标（基于处理尺寸）
-            # 注意：以左下角为原点，需要转换Y坐标
-            x1 = int(left * w)
-            x2 = int(right * w)
+        # 验证坐标范围
+        if not (0 <= left < right <= 1 and 0 <= bottom < top <= 1):
+            raise ValueError(f"无效的区域坐标: {region}，坐标必须在[0,1]范围内且left<right, bottom<top")
 
-            # Y坐标转换：左下角原点 -> 左上角原点（图像坐标系）
-            # bottom=0 表示最底部，在图像坐标系中是 h
-            # top=1 表示最顶部，在图像坐标系中是 0
-            y1 = int((1 - top) * h)      # 顶部在图像坐标系中的位置
-            y2 = int((1 - bottom) * h)   # 底部在图像坐标系中的位置
+        # 转换相对坐标到实际像素坐标（基于处理尺寸）
+        # 注意：以左下角为原点，需要转换Y坐标
+        x1 = int(left * w)
+        x2 = int(right * w)
 
-            # 确保坐标在有效范围内
-            x1 = max(0, min(x1, w - 1))
-            x2 = max(0, min(x2, w))
-            y1 = max(0, min(y1, h - 1))
-            y2 = max(0, min(y2, h))
+        # Y坐标转换：左下角原点 -> 左上角原点（图像坐标系）
+        # bottom=0 表示最底部，在图像坐标系中是 h
+        # top=1 表示最顶部，在图像坐标系中是 0
+        y1 = int((1 - top) * h)      # 顶部在图像坐标系中的位置
+        y2 = int((1 - bottom) * h)   # 底部在图像坐标系中的位置
 
-            # 绘制白色区域
-            mask[y1:y2, x1:x2] = 255
+        # 确保坐标在有效范围内
+        x1 = max(0, min(x1, w - 1))
+        x2 = max(0, min(x2, w))
+        y1 = max(0, min(y1, h - 1))
+        y2 = max(0, min(y2, h))
 
-            if frame_idx == 0:  # 只在第一帧打印信息
-                print(f"  区域 [left={left}, bottom={bottom}, right={right}, top={top}]")
-                print(f"    -> 像素坐标: x=[{x1},{x2}], y=[{y1},{y2}] (图像坐标系)")
+        # 绘制白色区域
+        mask[y1:y2, x1:x2] = 255
 
-        # 应用膨胀操作（与read_mask保持一致）
-        mask = cv2.dilate(mask, cv2.getStructuringElement(
-            cv2.MORPH_CROSS, (3, 3)), iterations=4)
+        print(f"  区域 [left={left}, bottom={bottom}, right={right}, top={top}]")
+        print(f"    -> 像素坐标: x=[{x1},{x2}], y=[{y1},{y2}] (图像坐标系)")
 
-        masks.append(Image.fromarray(mask))
+    # 应用膨胀操作（与read_mask保持一致）
+    mask = cv2.dilate(mask, cv2.getStructuringElement(
+        cv2.MORPH_CROSS, (3, 3)), iterations=4)
 
-    print(f"✓ 成功生成 {len(masks)} 帧mask")
-    return masks
+    # 只保存一张mask图片
+    mask_path = os.path.join(mask_dir, 'mask.png')
+    Image.fromarray(mask).save(mask_path)
+
+    print(f"✓ 成功生成单张mask (将复用于所有 {num_frames} 帧)")
+    print(f"✓ 节省空间: ~{(num_frames - 1) * mask.nbytes / 1024 / 1024:.1f}MB")
+    return mask_dir
 
 
 def main_worker():
@@ -357,54 +428,106 @@ def main_worker():
     setup_resolution(args.video, args.resolution, args.scale, args.short_side)
     print("="*60 + "\n")
 
-    # set up models
+    # 先生成或准备 mask（在加载模型之前）
+    temp_mask_dir = None  # 用于跟踪临时目录
+    if args.regions is not None:
+        # 从区域坐标生成mask
+        print("="*60)
+        print("生成 Mask")
+        print("="*60)
+        regions = json.loads(args.regions)
+        print(f"区域坐标: {regions}")
+
+        # 获取视频帧数
+        vidcap = cv2.VideoCapture(args.video)
+        video_length = int(vidcap.get(cv2.CAP_PROP_FRAME_COUNT))
+        vidcap.release()
+
+        temp_mask_dir = generate_masks_from_regions(args.video, regions, video_length)
+        print("="*60 + "\n")
+    else:
+        # 验证mask目录存在
+        print("="*60)
+        print("验证 Mask 目录")
+        print("="*60)
+        if not os.path.exists(args.mask):
+            raise ValueError(f"Mask目录不存在: {args.mask}")
+        mask_files = [f for f in os.listdir(args.mask) if f.endswith('.png') or f.endswith('.jpg')]
+        if not mask_files:
+            raise ValueError(f"Mask目录中没有图片文件: {args.mask}")
+        print(f"✓ Mask目录: {args.mask}")
+        print(f"✓ 找到 {len(mask_files)} 个mask文件")
+        print("="*60 + "\n")
+
+    # 加载模型
+    print("="*60)
+    print("加载模型")
+    print("="*60)
     if torch.cuda.is_available():
         device = torch.device("cuda")
         print(f"✓ 使用设备: {device} (GPU: {torch.cuda.get_device_name(0)})")
     else:
         device = torch.device("cpu")
         print(f"✓ 使用设备: CPU")
+
     net = importlib.import_module('src.model.' + args.model)
     model = net.InpaintGenerator().to(device)
     model_path = args.ckpt
     data = torch.load(args.ckpt, map_location=device, weights_only=False)
     model.load_state_dict(data['netG'])
-    print('loading from: {}'.format(args.ckpt))
+    print(f'✓ 模型加载完成: {args.ckpt}')
     model.eval()
+    print("="*60 + "\n")
 
-    # prepare datset, encode all frames into deep space
+    # 加载视频帧
+    print("="*60)
+    print("加载视频帧")
+    print("="*60)
     frames = read_frame_from_videos(args.video)
     video_length = len(frames)
+    print(f"✓ 加载 {video_length} 帧")
     feats = _to_tensors(frames).unsqueeze(0)*2-1
     frames = [np.array(f).astype(np.uint8) for f in frames]
+    print("="*60 + "\n")
 
-    # 根据输入方式生成或读取mask
-    if args.regions is not None:
-        # 从区域坐标生成mask
-        print("\n使用区域坐标生成mask...")
-        regions = json.loads(args.regions)
-        print(f"区域坐标: {regions}")
-        masks = generate_masks_from_regions(args.video, regions, video_length)
+    # 加载mask
+    print("="*60)
+    print("加载 Mask")
+    print("="*60)
+    if temp_mask_dir is not None:
+        masks = read_mask(temp_mask_dir, video_length)
     else:
-        # 从文件读取mask
-        print("\n从文件读取mask...")
-        masks = read_mask(args.mask)
+        masks = read_mask(args.mask, video_length)
+    print(f"✓ 加载 {len(masks)} 个mask")
+    print("="*60 + "\n")
 
     binary_masks = [np.expand_dims((np.array(m) != 0).astype(np.uint8), 2) for m in masks]
     masks = _to_tensors(masks).unsqueeze(0)
     feats, masks = feats.to(device), masks.to(device)
     comp_frames = [None]*video_length
 
+    # 编码特征
+    print("="*60)
+    print("编码视频特征")
+    print("="*60)
     with torch.no_grad():
         feats = model.encoder((feats*(1-masks).float()).view(video_length, 3, h, w))
         _, c, feat_h, feat_w = feats.size()
         feats = feats.view(1, video_length, c, feat_h, feat_w)
-    print('loading videos and masks from: {}'.format(args.video))
+    print(f'✓ 特征编码完成: {video_length} 帧')
+    print("="*60 + "\n")
 
-    # completing holes by spatial-temporal transformers
-    for f in range(0, video_length, neighbor_stride):
+    # 修复视频
+    print("="*60)
+    print("开始修复视频")
+    print("="*60)
+    total_steps = (video_length + neighbor_stride - 1) // neighbor_stride
+    for step, f in enumerate(range(0, video_length, neighbor_stride), 1):
         neighbor_ids = [i for i in range(max(0, f-neighbor_stride), min(video_length, f+neighbor_stride+1))]
         ref_ids = get_ref_index(neighbor_ids, video_length)
+
+        print(f"处理进度: {step}/{total_steps} (帧 {f}-{min(f+neighbor_stride, video_length)}/{video_length})", end='\r')
+
         with torch.no_grad():
             pred_feat = model.infer(
                 feats[0, neighbor_ids+ref_ids, :, :, :], masks[0, neighbor_ids+ref_ids, :, :, :])
@@ -421,23 +544,50 @@ def main_worker():
                 else:
                     comp_frames[idx] = comp_frames[idx].astype(
                         np.float32)*0.5 + img.astype(np.float32)*0.5
+    print()  # 换行
+    print(f'✓ 视频修复完成')
+    print("="*60 + "\n")
     # 确定输出路径
     if args.output:
         output_path = args.output
-    elif args.mask:
-        output_path = f"{args.mask}_result.mp4"
     else:
-        # 使用regions时，基于输入视频名称生成输出路径
-        video_name = os.path.splitext(os.path.basename(args.video))[0]
-        output_path = f"{video_name}_inpainted.mp4"
+        # 默认输出到output目录
+        output_base = "output"
+        os.makedirs(output_base, exist_ok=True)
+
+        if args.mask:
+            # 使用mask目录名称
+            mask_basename = os.path.basename(args.mask.rstrip('/'))
+            output_path = os.path.join(output_base, f"{mask_basename}_result.mp4")
+        else:
+            # 使用视频名称
+            video_name = os.path.splitext(os.path.basename(args.video))[0]
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = os.path.join(output_base, f"{video_name}_inpainted_{timestamp}.mp4")
+
+    # 保存输出视频
+    print("="*60)
+    print("保存输出视频")
+    print("="*60)
+    print(f"输出路径: {output_path}")
 
     writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), default_fps, (w, h))
     for f in range(video_length):
         comp = np.array(comp_frames[f]).astype(
             np.uint8)*binary_masks[f] + frames[f] * (1-binary_masks[f])
         writer.write(cv2.cvtColor(np.array(comp).astype(np.uint8), cv2.COLOR_BGR2RGB))
+        print(f"写入帧: {f+1}/{video_length}", end='\r')
     writer.release()
-    print('✓ 处理完成！输出文件: {}'.format(output_path))
+    print()  # 换行
+    print(f'✓ 视频保存完成: {output_path}')
+
+    # 保留mask目录供用户查看
+    if temp_mask_dir is not None:
+        print(f'✓ Mask文件保存在: {temp_mask_dir}')
+    print("="*60 + "\n")
+
+    print("🎉 全部完成！")
 
 
 

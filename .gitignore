@@ -12,3 +12,4 @@ examples/*_result.mp4
 *.zip
 __pycache__/
 *.mp4
+output/
